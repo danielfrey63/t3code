@@ -22,6 +22,11 @@ const projectId = ProjectId.make("agent-session-import-project");
 const providerInstanceId = ProviderInstanceId.make("codex");
 const providerSessionId = "native-codex-thread";
 const threadId = ThreadId.make(`import:${providerInstanceId}:${providerSessionId}`);
+const unusedScannerMethods = {
+  scan: Effect.die("unused"),
+  resolveHomes: () => Effect.die("unused"),
+  findClaudeTranscript: () => Effect.die("unused"),
+};
 
 it.effect("imports messages once and preserves the provider native resume binding", () => {
   const writes: Array<ReadonlyArray<OrchestrationV2DomainEvent>> = [];
@@ -29,7 +34,7 @@ it.effect("imports messages once and preserves the provider native resume bindin
   const recorded: Array<unknown> = [];
   let imported = false;
   const scanner = AgentSessionScanner.AgentSessionScanner.of({
-    scan: Effect.die("unused"),
+    ...unusedScannerMethods,
     recentThreads: () =>
       Stream.succeed({
         _tag: "Importable",
@@ -174,7 +179,7 @@ it.effect("follows transcript renames and compactions for imported threads", () 
   ]);
   const dispatched: Array<{ readonly threadId: string; readonly title: string | undefined }> = [];
   const scanner = AgentSessionScanner.AgentSessionScanner.of({
-    scan: Effect.die("unused"),
+    ...unusedScannerMethods,
     recentThreads: () =>
       Stream.make(
         {
