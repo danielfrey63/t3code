@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 /** Coding agent home directories the scanner knows how to read. */
@@ -118,5 +124,108 @@ export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanEr
 ) {
   override get message(): string {
     return `Failed to scan agent sessions during ${this.operation}.`;
+  }
+}
+
+/** Native sessions an environment can continue in one of its projects. */
+export const AgentSessionListInput = Schema.Struct({ projectId: ProjectId });
+export type AgentSessionListInput = typeof AgentSessionListInput.Type;
+
+export const AgentSessionSummary = Schema.Struct({
+  provider: AgentSessionSource,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  updatedAt: IsoDateTime,
+  /** The thread already bound to this session on the listing environment. */
+  threadId: Schema.NullOr(ThreadId),
+});
+export type AgentSessionSummary = typeof AgentSessionSummary.Type;
+
+export const AgentSessionListResult = Schema.Struct({
+  sessions: Schema.Array(AgentSessionSummary),
+});
+export type AgentSessionListResult = typeof AgentSessionListResult.Type;
+
+/** Continue one local native session as a thread, importing it when needed. */
+export const AgentSessionOpenInput = Schema.Struct({
+  projectId: ProjectId,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+});
+export type AgentSessionOpenInput = typeof AgentSessionOpenInput.Type;
+
+export const AgentSessionOpenResult = Schema.Struct({ threadId: ThreadId });
+export type AgentSessionOpenResult = typeof AgentSessionOpenResult.Type;
+
+/**
+ * A Claude session as Claude keeps it: the transcript and its sidecar
+ * directory (`tool-results/`, `subagents/`), byte for byte. Paths are relative
+ * to the session's project directory.
+ */
+export const AgentSessionBundle = Schema.Struct({
+  provider: Schema.Literal("claudeAgent"),
+  providerSessionId: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  files: Schema.Array(
+    Schema.Struct({
+      path: TrimmedNonEmptyString,
+      contentBase64: Schema.String,
+    }),
+  ),
+});
+export type AgentSessionBundle = typeof AgentSessionBundle.Type;
+
+export const AgentSessionBundleParams = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+});
+export type AgentSessionBundleParams = typeof AgentSessionBundleParams.Type;
+
+/**
+ * Continue a session from another environment. A Claude target receives a
+ * 1:1 copy it resumes natively; any other target gets the conversation as
+ * imported history, injected into its first native turn.
+ */
+export const AgentSessionReceiveInput = Schema.Struct({
+  projectId: ProjectId,
+  targetProviderInstanceId: ProviderInstanceId,
+  bundle: AgentSessionBundle,
+});
+export type AgentSessionReceiveInput = typeof AgentSessionReceiveInput.Type;
+
+export class AgentSessionTransferError extends Schema.TaggedError<AgentSessionTransferError>()(
+  "AgentSessionTransferError",
+  {
+    reason: Schema.Literals([
+      "session-not-found",
+      "project-not-found",
+      "unsupported-target",
+      "invalid-bundle",
+      "too-large",
+      "diverged",
+      "write-failed",
+    ]),
+    detail: Schema.optional(Schema.String),
+  },
+  { httpApiStatus: 422 },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "session-not-found":
+        return "The session is no longer available on its environment.";
+      case "project-not-found":
+        return "The target project does not exist.";
+      case "unsupported-target":
+        return "This provider cannot continue the session.";
+      case "invalid-bundle":
+        return "The session could not be read.";
+      case "too-large":
+        return "The session is too large to transfer.";
+      case "diverged":
+        return "The session was continued separately on both environments.";
+      case "write-failed":
+        return "The session could not be saved on this environment.";
+    }
   }
 }

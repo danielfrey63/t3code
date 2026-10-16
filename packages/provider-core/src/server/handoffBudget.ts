@@ -115,6 +115,12 @@ export function handoffBudget(input: {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly nativeContextEstimate: number;
   readonly modelContextWindow?: number | undefined;
+  /**
+   * Imported history injected as native items, not prepended to the prompt.
+   * It is the whole conversation the thread continues, so only the model
+   * window bounds it.
+   */
+  readonly injectsImportedHistory?: boolean;
 }): number {
   const usage = input.providerThread.contextUsage;
   const window = Math.min(
@@ -125,6 +131,8 @@ export function handoffBudget(input: {
   const native = usage?.usedTokens ?? input.nativeContextEstimate;
   const current =
     Buffer.byteLength(JSON.stringify(input.userText)) + attachmentTokenAllowance(input.attachments);
+  const windowBudget = window - native - current - Math.max(16_000, Math.ceil(window / 4));
+  if (input.injectsImportedHistory === true) return Math.max(0, windowBudget);
   return Math.max(
     0,
     Math.min(
@@ -132,10 +140,16 @@ export function handoffBudget(input: {
       // Cap only imported history. Attachment transport limits belong to adapters;
       // they may send binary/base64 data separately from the history request.
       HANDOFF_BYTE_CAP,
-      window - native - current - Math.max(16_000, Math.ceil(window / 4)),
+      windowBudget,
     ),
   );
 }
+
+/**
+ * Imported history kept on its handoff record. Delivery selects from it
+ * again within the target's budget, which can be a whole model window.
+ */
+export const IMPORTED_HISTORY_RECORD_CAP = 1_000_000;
 
 export function historicalMessage(
   item: OrchestrationV2TurnItem,

@@ -56,6 +56,13 @@ import {
   OrchestrationV2ThreadHistoryPage,
   OrchestrationV2ThreadTranscript,
 } from "./orchestrationV2.ts";
+import {
+  AgentSessionBundle,
+  AgentSessionBundleParams,
+  AgentSessionOpenResult,
+  AgentSessionReceiveInput,
+  AgentSessionTransferError,
+} from "./agentSessions.ts";
 import { Project, ProjectMutation, ProjectSnapshot } from "./project.ts";
 import {
   PullRequestDiffInput,
@@ -687,6 +694,39 @@ class EnvironmentPullRequestsHttpApi extends HttpApiGroup.make("pullRequests").a
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+/** Native session transcripts can run to tens of MiB, too large for the RPC socket. */
+class EnvironmentAgentSessionsHttpApi extends HttpApiGroup.make("agentSessions")
+  .add(
+    HttpApiEndpoint.get(
+      "bundle",
+      "/api/agent-sessions/:providerInstanceId/:providerSessionId/bundle",
+      {
+        headers: OptionalBearerHeaders,
+        params: AgentSessionBundleParams,
+        success: AgentSessionBundle,
+        error: [
+          AgentSessionTransferError,
+          EnvironmentAuthInvalidError,
+          EnvironmentScopeRequiredError,
+          EnvironmentInternalError,
+        ],
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("receive", "/api/agent-sessions/receive", {
+      headers: OptionalBearerHeaders,
+      payload: AgentSessionReceiveInput,
+      success: AgentSessionOpenResult,
+      error: [
+        AgentSessionTransferError,
+        EnvironmentAuthInvalidError,
+        EnvironmentScopeRequiredError,
+        EnvironmentInternalError,
+      ],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  ) {}
+
 class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
   .add(
     HttpApiEndpoint.post("linkProof", "/api/connect/link-proof", {
@@ -778,6 +818,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMcpOAuthHttpApi)
   .add(EnvironmentOrchestrationHttpApi)
   .add(EnvironmentPullRequestsHttpApi)
+  .add(EnvironmentAgentSessionsHttpApi)
   .add(EnvironmentProjectsHttpApi)
   .add(EnvironmentConnectHttpApi)
   .add(EnvironmentWebhooksHttpApi) {}

@@ -1130,6 +1130,9 @@ export const layer: Layer.Layer<
               return handoffBudget({
                 tokenCap,
                 modelContextWindow,
+                injectsImportedHistory:
+                  session.injectHistory !== undefined &&
+                  effectiveHandoffs.some((handoff) => handoff.strategy === "manual_context"),
                 // The note is sent with the user text, so it spends the same allowance.
                 userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
                 attachments: message.attachments,

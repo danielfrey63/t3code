@@ -208,6 +208,22 @@ describe("handoff budget", () => {
     }
   });
 
+  it("lets injected imported history use the model window beyond the handoff cap", () => {
+    const base = {
+      tokenCap: 16_000,
+      userText: "Continue",
+      attachments: [],
+      providerThread,
+      nativeContextEstimate: 0,
+      modelContextWindow: 400_000,
+    };
+    assert.equal(handoffBudget(base), 16_000);
+    const injected = handoffBudget({ ...base, injectsImportedHistory: true });
+    assert.isAbove(injected, 200_000);
+    // The reserve for instructions and work still applies.
+    assert.isBelow(injected, 300_000);
+  });
+
   it("subtracts native usage, input, attachments, instructions and space for work", () => {
     const base = {
       tokenCap: 16_000,

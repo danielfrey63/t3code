@@ -18,6 +18,7 @@ import {
   handoffTokenCapConfig,
   handoffCoverage,
   historicalMessage,
+  IMPORTED_HISTORY_RECORD_CAP,
   renderHistory,
   selectHistory,
 } from "@t3tools/provider-core/server/handoffBudget";
@@ -267,7 +268,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
             return message === null ? [] : [message];
           }),
           coverage,
-          budget: tokenCap,
+          budget: IMPORTED_HISTORY_RECORD_CAP,
         });
         return {
           id: handoffId,

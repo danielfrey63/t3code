@@ -97,6 +97,8 @@ const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;
 const MAX_IMPORT_RECORDS = 100_000;
+/** Raw bytes of one transferred Claude session, transcript and sidecar files together. */
+const MAX_CLAUDE_BUNDLE_BYTES = 128 * 1024 * 1024;
 
 const TranscriptContentBlock = Schema.Struct({
   type: Schema.optional(Schema.String),
@@ -157,6 +159,8 @@ interface AgentSessionTranscriptMetadata {
   readonly providerInstanceId: ProviderInstanceId;
   readonly fallbackSessionId: string;
   readonly lastActiveAtMs: number;
+  /** Newest messages kept, plus the first prompt. Defaults to the import cap. */
+  readonly maxMessages?: number;
 }
 
 export interface AgentSessionThreadMessage {
@@ -205,7 +209,23 @@ export class AgentSessionScanner extends Context.Service<
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      /** `fresh` rediscovers transcripts instead of reusing this instance's last scan. */
+      options?: { readonly fresh?: boolean },
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+    /**
+     * Raw files of a Claude session: the transcript, then its sidecar
+     * directory. `truncated` when the session exceeds the transfer budget.
+     */
+    readonly readClaudeBundle: (
+      providerInstanceId: ProviderInstanceId,
+      sessionId: string,
+    ) => Effect.Effect<
+      Option.Option<{
+        readonly files: ReadonlyArray<{ readonly path: string; readonly bytes: Uint8Array }>;
+        readonly truncated: boolean;
+      }>,
+      AgentSessionScanError
+    >;
     readonly resolveHomes: (
       source: AgentSessionSource,
     ) => Effect.Effect<
@@ -395,6 +415,7 @@ function parseAgentSessionRecords(
   input: AgentSessionTranscriptMetadata,
   records: ReadonlyArray<DecodedTranscriptRecord>,
 ): AgentSessionThread | null {
+  const maxMessages = input.maxMessages ?? MAX_IMPORTED_MESSAGES;
   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
   // Claude filenames are session IDs. Codex rollout filenames include extra
   // timestamp text, so only transcript metadata can provide a resumable ID.
@@ -470,7 +491,7 @@ function parseAgentSessionRecords(
       firstUserMessage = message;
     }
     messages.push(message);
-    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
+    if (messages.length > maxMessages) messages.shift();
   };
 
   const hasMatchingCodexEventInTurn = (text: string) => {
@@ -592,7 +613,7 @@ function parseAgentSessionRecords(
   const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
   const retainedMessages = firstUserMessageRetained
     ? visibleMessages
-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
+    : [visibleFirstUserMessage, ...visibleMessages.slice(-(maxMessages - 1))];
   const derivedTitle = visibleFirstUserMessage.text.trim().split("\n")[0]?.slice(0, 100).trim();
 
   return {
@@ -1514,6 +1535,7 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    fresh = false,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -1522,8 +1544,17 @@ export const make = Effect.gen(function* () {
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
 
-    const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
+    const candidates = (fresh ? null : cachedCandidates) ?? (yield* collectCandidates()).candidates;
     cachedCandidates = candidates;
+    // Claude resumes whatever sits in the directory derived from the cwd, so
+    // a transcript copied there belongs to this root whatever cwds it records.
+    const fold = (value: string) => (foldWorktreeCase ? value.toLowerCase() : value);
+    const rootClaudeDirectories = new Set(
+      [root, realRoot].map((directory) => fold(claudeProjectDirectoryName(directory))),
+    );
+    const isInRootClaudeDirectory = (source: AgentSessionSource, filePath: string) =>
+      source === "claudeAgent" &&
+      rootClaudeDirectories.has(fold(path.basename(path.dirname(filePath))));
 
     const eligibleTranscripts: Array<{
       readonly candidate: RawCandidate;
@@ -1531,11 +1562,14 @@ export const make = Effect.gen(function* () {
     }> = [];
     for (const candidate of candidates) {
       const expanded = expandHomePath(candidate.cwd.trim(), homeDir);
-      if (!path.isAbsolute(expanded)) continue;
-      const resolved = path.resolve(expanded);
-      if ((yield* directoryIdentity(resolved)) !== rootIdentity) continue;
+      const cwdMatchesRoot =
+        path.isAbsolute(expanded) &&
+        (yield* directoryIdentity(path.resolve(expanded))) === rootIdentity;
 
       for (const transcript of candidate.transcripts) {
+        if (!cwdMatchesRoot && !isInRootClaudeDirectory(candidate.source, transcript.filePath)) {
+          continue;
+        }
         if (
           transcript.mtimeMs === null ||
           transcript.mtimeMs < cutoffMs ||
@@ -1645,8 +1679,9 @@ export const make = Effect.gen(function* () {
           }
           const expandedCwd = expandHomePath(snapshotCwd.trim(), homeDir);
           if (
-            !path.isAbsolute(expandedCwd) ||
-            (yield* directoryIdentity(path.resolve(expandedCwd))) !== rootIdentity
+            !isInRootClaudeDirectory(candidate.source, transcript.filePath) &&
+            (!path.isAbsolute(expandedCwd) ||
+              (yield* directoryIdentity(path.resolve(expandedCwd))) !== rootIdentity)
           ) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
@@ -1705,9 +1740,49 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    options,
+  ) =>
+    Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, options?.fresh === true));
 
-  return AgentSessionScanner.of({ scan, recentThreads, resolveHomes, findClaudeTranscript });
+  const readClaudeBundle: AgentSessionScanner["Service"]["readClaudeBundle"] = Effect.fn(
+    "AgentSessionScanner.readClaudeBundle",
+  )(function* (providerInstanceId, sessionId) {
+    const transcriptPath = yield* findClaudeTranscript(providerInstanceId, sessionId);
+    if (Option.isNone(transcriptPath)) return Option.none();
+    const directory = path.dirname(transcriptPath.value);
+    const files: Array<{ readonly path: string; readonly bytes: Uint8Array }> = [];
+    let totalBytes = 0;
+    const addFile = Effect.fn(function* (relativePath: string) {
+      const bytes = yield* fileSystem.readFile(path.join(directory, relativePath));
+      totalBytes += bytes.byteLength;
+      if (totalBytes > MAX_CLAUDE_BUNDLE_BYTES) return false;
+      files.push({ path: relativePath.split(path.sep).join("/"), bytes });
+      return true;
+    });
+    const sidecar = path.join(directory, sessionId);
+    const sidecarFiles = (yield* fileSystem
+      .readDirectory(sidecar, { recursive: true })
+      .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []))).toSorted();
+    const included = yield* Effect.gen(function* () {
+      if (!(yield* addFile(`${sessionId}.jsonl`))) return false;
+      for (const entry of sidecarFiles) {
+        const stats = yield* statOption(path.join(sidecar, entry));
+        if (Option.isNone(stats) || stats.value.type !== "File") continue;
+        if (!(yield* addFile(path.join(sessionId, entry)))) return false;
+      }
+      return true;
+    }).pipe(Effect.orElseSucceed(() => null));
+    if (included === null) return Option.none();
+    return Option.some({ files, truncated: !included });
+  });
+
+  return AgentSessionScanner.of({
+    scan,
+    recentThreads,
+    resolveHomes,
+    findClaudeTranscript,
+    readClaudeBundle,
+  });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make);

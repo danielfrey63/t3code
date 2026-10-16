@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
   ProjectId,
@@ -14,6 +15,7 @@ import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionImporter from "./AgentSessionImporter.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import * as ProjectService from "./ProjectService.ts";
@@ -26,7 +28,12 @@ const unusedScannerMethods = {
   scan: Effect.die("unused"),
   resolveHomes: () => Effect.die("unused"),
   findClaudeTranscript: () => Effect.die("unused"),
+  readClaudeBundle: () => Effect.die("unused"),
 };
+const layerImporterPlatform = Layer.mergeAll(
+  NodeServices.layer,
+  Layer.mock(ServerSettings.ServerSettingsService)({}),
+);
 
 it.effect("imports messages once and preserves the provider native resume binding", () => {
   const writes: Array<ReadonlyArray<OrchestrationV2DomainEvent>> = [];
@@ -101,6 +108,7 @@ it.effect("imports messages once and preserves the provider native resume bindin
           recordImportedTranscript: (input) => Effect.sync(() => void recorded.push(input)),
         }),
         IdAllocator.layer,
+        layerImporterPlatform,
       ),
     ),
   );
@@ -234,6 +242,7 @@ it.effect("follows transcript renames and compactions for imported threads", () 
           recordImportedTranscript: () => Effect.void,
         }),
         IdAllocator.layer,
+        layerImporterPlatform,
       ),
     ),
   );
