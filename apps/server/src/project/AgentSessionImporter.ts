@@ -8,6 +8,7 @@ import {
   AgentSessionImportSource,
   AgentSessionScanError,
   AgentSessionSource,
+  CommandId,
   EventId,
   MessageId,
   ProjectId,
@@ -172,6 +173,32 @@ const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  const syncImportedTitle = (input: {
+    readonly threadId: ThreadId;
+    readonly currentTitle: string;
+    readonly title: string;
+    readonly source: AgentSessionImportSource;
+  }) =>
+    input.title.trim() === "" || input.title === input.currentTitle
+      ? Effect.void
+      : orchestrator
+          .dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(
+              `${IMPORT_EVENT_PREFIX}:title:${input.threadId}:${input.source.size}:${input.source.mtimeMs ?? 0}`,
+            ),
+            threadId: input.threadId,
+            title: input.title,
+          })
+          .pipe(
+            Effect.asVoid,
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not update an imported thread title", {
+                threadId: input.threadId,
+                cause,
+              }),
+            ),
+          );
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
   ) {
@@ -229,6 +256,22 @@ const make = Effect.gen(function* () {
         if (outcome._tag === "AlreadyImported") {
           importedThreadIds.add(threadId);
           importedCount += 1;
+          if (outcome.continuedAfterCompact) {
+            yield* Effect.option(orchestrator.getThreadRecords(threadId, [])).pipe(
+              Effect.flatMap(
+                Option.match({
+                  onNone: () => Effect.void,
+                  onSome: ({ thread }) =>
+                    syncImportedTitle({
+                      threadId,
+                      currentTitle: thread.title,
+                      title: AgentSessionScanner.withBeforeCompactSuffix(thread.title),
+                      source,
+                    }),
+                }),
+              ),
+            );
+          }
           return;
         }
         if (outcome._tag === "Duplicate") {
@@ -261,6 +304,14 @@ const make = Effect.gen(function* () {
             if (existing.value.thread.historyOrigin !== "v1_import") {
               return yield* new AgentSessionThreadModifiedError({ threadId });
             }
+            // A `/rename` in the CLI, or a compaction that continued in a newer
+            // file, changes the name this transcript should be listed under.
+            yield* syncImportedTitle({
+              threadId,
+              currentTitle: existing.value.thread.title,
+              title: thread.title,
+              source,
+            });
             yield* runtimes.recordImportedTranscript({ threadId, source });
             return true;
           }

@@ -17,6 +17,17 @@ export const AgentSessionImportSource = Schema.Struct({
   device: Schema.Number,
   inode: Schema.NullOr(Schema.Number),
   birthtimeMs: Schema.NullOr(Schema.Number),
+  /**
+   * Claude compact lineage, so an unchanged transcript can still learn that a
+   * newer file continues it after compaction: its last record ids, and the
+   * records in other files that it continues from.
+   */
+  lineage: Schema.optional(
+    Schema.Struct({
+      tailUuids: Schema.Array(Schema.String),
+      continuesFrom: Schema.Array(Schema.String),
+    }),
+  ),
 });
 export type AgentSessionImportSource = typeof AgentSessionImportSource.Type;
 

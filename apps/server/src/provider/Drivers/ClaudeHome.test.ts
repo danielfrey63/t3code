@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
 
 import {
+  claudeProjectDirectoryName,
   claudeSignedOutMessage,
   makeClaudeCapabilitiesCacheKey,
   makeClaudeContinuationGroupKey,
@@ -14,6 +15,16 @@ import {
 } from "./ClaudeHome.ts";
 
 it.layer(NodeServices.layer)("ClaudeHome", (it) => {
+  describe("Claude project directory names", () => {
+    it("matches the directory the CLI derives from a cwd", () => {
+      expect(claudeProjectDirectoryName("/home/daniel/Develop/pmo")).toBe(
+        "-home-daniel-Develop-pmo",
+      );
+      expect(claudeProjectDirectoryName("D:\\Meine Ablage\\pmo")).toBe("D--Meine-Ablage-pmo");
+      expect(claudeProjectDirectoryName(`/${"a".repeat(240)}`)).toBe(`-${"a".repeat(199)}-p2jdu9`);
+    });
+  });
+
   describe("Claude home resolution", () => {
     it.effect("treats empty, ~/.claude, and the expanded default as the same Claude home", () =>
       Effect.gen(function* () {

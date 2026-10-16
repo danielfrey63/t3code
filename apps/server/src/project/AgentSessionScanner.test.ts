@@ -20,6 +20,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import { claudeProjectDirectoryName } from "../provider/Drivers/ClaudeHome.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 
@@ -1402,6 +1403,82 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         }),
     );
 
+    it.effect("imports a transcript copied from another machine and marks compacted parts", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-copied-claude-");
+        const codexHomePath = yield* makeTempDir("t3code-copied-codex-");
+        const workspace = yield* makeTempDir("t3code-copied-workspace-");
+        const directory = path.join(
+          claudeHomePath,
+          "projects",
+          claudeProjectDirectoryName(workspace),
+        );
+        const line = (record: Record<string, unknown>) => encodeTranscriptRecord(record);
+
+        yield* writeTranscript({
+          filePath: path.join(directory, "11111111-1111-4111-8111-111111111111.jsonl"),
+          contents: [
+            line({ type: "custom-title", customTitle: "Release" }),
+            line({
+              type: "user",
+              uuid: "a1",
+              parentUuid: null,
+              cwd: "D:\\Work\\project",
+              sessionId: "11111111-1111-4111-8111-111111111111",
+              message: { role: "user", content: "Prepare the release" },
+            }),
+            line({
+              type: "assistant",
+              uuid: "a2",
+              parentUuid: "a1",
+              cwd: workspace,
+              sessionId: "11111111-1111-4111-8111-111111111111",
+              message: { role: "assistant", content: [{ type: "text", text: "Prepared" }] },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs - 2_000,
+        });
+        yield* writeTranscript({
+          filePath: path.join(directory, "22222222-2222-4222-8222-222222222222.jsonl"),
+          contents: [
+            line({
+              type: "system",
+              subtype: "compact_boundary",
+              uuid: "b1",
+              parentUuid: null,
+              logicalParentUuid: "a2",
+              cwd: workspace,
+              sessionId: "22222222-2222-4222-8222-222222222222",
+            }),
+            line({ type: "custom-title", customTitle: "Release" }),
+            line({
+              type: "user",
+              uuid: "b2",
+              parentUuid: "b1",
+              cwd: workspace,
+              sessionId: "22222222-2222-4222-8222-222222222222",
+              message: { role: "user", content: "Ship it" },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs - 1_000,
+        });
+
+        const outcomes = yield* runRecentThreadOutcomes({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+        expect(
+          outcomes.flatMap((outcome) =>
+            outcome._tag === "Importable" ? [outcome.thread.title] : [outcome._tag],
+          ),
+        ).toEqual(["Release", "Release (before compact)"]);
+      }),
+    );
+
     it.effect("imports recent Claude and Codex sessions for the selected project only", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
@@ -2672,6 +2749,49 @@ describe("parseAgentSessionTranscript", () => {
         { role: "assistant", text: "The provider request failed" },
       ],
     });
+  });
+
+  it("prefers the latest /rename title over generated titles", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        JSON.stringify({ type: "ai-title", aiTitle: "Generated early" }),
+        JSON.stringify({
+          type: "custom-title",
+          customTitle: "Profile@WORK\n<system-reminder>Message sent at Tue.</system-reminder>",
+        }),
+        JSON.stringify({
+          type: "user",
+          sessionId: "claude-session",
+          message: { role: "user", content: "Set up profiles" },
+        }),
+        JSON.stringify({ type: "custom-title", customTitle: "PMO@HOME" }),
+        JSON.stringify({ type: "ai-title", aiTitle: "Generated late" }),
+      ].join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+    expect(thread?.title).toBe("PMO@HOME");
+    expect(AgentSessionScanner.cleanClaudeSessionTitle("Profile@WORK\n<system-reminder>x")).toBe(
+      "Profile@WORK",
+    );
+  });
+
+  it("links a compacted continuation to the transcript it left behind", () => {
+    const older = AgentSessionScanner.claudeTranscriptLineage([
+      { type: "user", uuid: "a1", parentUuid: null },
+      { type: "assistant", uuid: "a2", parentUuid: "a1" },
+    ]);
+    const newer = AgentSessionScanner.claudeTranscriptLineage([
+      { type: "system", subtype: "compact_boundary", uuid: "b1", logicalParentUuid: "a2" },
+      { type: "user", uuid: "b2", parentUuid: "b1", isCompactSummary: true },
+      { type: "system", subtype: "compact_boundary", uuid: "b3", logicalParentUuid: "b2" },
+    ]);
+    expect(older).toEqual({ tailUuids: ["a1", "a2"], continuesFrom: [] });
+    // An in-file compaction points inside the same transcript and links nothing.
+    expect(newer.continuesFrom).toEqual(["a2"]);
+    expect(newer.tailUuids.some((uuid) => older.continuesFrom.includes(uuid))).toBe(false);
   });
 
   it("drops injected Codex instructions while keeping the visible user event", () => {

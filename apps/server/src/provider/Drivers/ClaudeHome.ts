@@ -73,6 +73,24 @@ export const hasClaudeManagedMcpConfig = Effect.fn("hasClaudeManagedMcpConfig")(
   return yield* fileSystem.exists(managedMcpConfigPath).pipe(Effect.orElseSucceed(() => false));
 });
 
+const CLAUDE_PROJECT_DIRECTORY_MAX_LENGTH = 200;
+
+/**
+ * Directory name Claude Code uses below `<config>/projects` for a session cwd.
+ * The CLI only finds a transcript to resume when it sits in the directory
+ * derived from its current cwd, so copied transcripts must land here too.
+ * Mirrors the CLI: non-alphanumerics become `-`, long names get a hash suffix.
+ */
+export function claudeProjectDirectoryName(cwd: string): string {
+  const sanitized = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  if (sanitized.length <= CLAUDE_PROJECT_DIRECTORY_MAX_LENGTH) return sanitized;
+  let hash = 0;
+  for (let index = 0; index < cwd.length; index++) {
+    hash = ((hash << 5) - hash + cwd.charCodeAt(index)) | 0;
+  }
+  return `${sanitized.slice(0, CLAUDE_PROJECT_DIRECTORY_MAX_LENGTH)}-${Math.abs(hash).toString(36)}`;
+}
+
 export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationGroupKey")(
   function* (
     config: Pick<ClaudeSettings, "homePath">,

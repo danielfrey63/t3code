@@ -49,6 +49,7 @@ import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import { claudeProjectDirectoryName } from "../provider/Drivers/ClaudeHome.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as ServerSettings from "../serverSettings.ts";
@@ -64,6 +65,8 @@ const TRANSCRIPT_PREFIX_BYTES = 32 * 1024;
 const METADATA_READ_BYTES = 8 * 1024;
 /** Prevent malformed transcripts from turning project discovery into a full file scan. */
 const MAX_TRANSCRIPT_SCAN_BYTES = 1024 * 1024;
+/** Tail read for transcripts copied from another machine, whose first cwd is foreign. */
+const CLAUDE_TAIL_READ_BYTES = 256 * 1024;
 
 /**
  * Upper bound on transcripts inspected (first line read) per source.
@@ -116,6 +119,11 @@ const TranscriptRecord = Schema.Struct({
   cwd: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
   aiTitle: Schema.optional(Schema.String),
+  customTitle: Schema.optional(Schema.String),
+  subtype: Schema.optional(Schema.String),
+  uuid: Schema.optional(Schema.String),
+  parentUuid: Schema.optional(Schema.NullOr(Schema.String)),
+  logicalParentUuid: Schema.optional(Schema.NullOr(Schema.String)),
   isSidechain: Schema.optional(Schema.Boolean),
   isMeta: Schema.optional(Schema.Boolean),
   isCompactSummary: Schema.optional(Schema.Boolean),
@@ -174,7 +182,12 @@ export type AgentSessionRecentThread =
       readonly thread: AgentSessionThread;
       readonly source: AgentSessionImportSource;
     }
-  | { readonly _tag: "AlreadyImported"; readonly source: AgentSessionImportSource }
+  | {
+      readonly _tag: "AlreadyImported";
+      readonly source: AgentSessionImportSource;
+      /** A newer transcript continues this one after a compaction. */
+      readonly continuedAfterCompact: boolean;
+    }
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Skipped" };
 
@@ -265,6 +278,79 @@ function extractText(
     .join("\n");
 }
 
+/**
+ * Claude Code appends harness text such as `<system-reminder>` blocks to a
+ * `/rename` argument in some versions. Keep only the name the user typed.
+ */
+export function cleanClaudeSessionTitle(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  const cleaned = value
+    .replace(/<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 0 ? cleaned.slice(0, 200) : null;
+}
+
+/** Claude records near the end of a transcript that a continuation can point back to. */
+const CLAUDE_LINEAGE_TAIL_UUIDS = 16;
+
+/**
+ * Compact lineage of one Claude transcript. A compaction that continues in a
+ * new file leaves the old, complete transcript behind; the new file's compact
+ * boundary names the old file's last record as its logical parent.
+ */
+export function claudeTranscriptLineage(records: ReadonlyArray<DecodedTranscriptRecord>): {
+  readonly tailUuids: ReadonlyArray<string>;
+  readonly continuesFrom: ReadonlyArray<string>;
+} {
+  const defined = new Set<string>();
+  const parents: Array<string> = [];
+  let compacted = false;
+  let firstParent: string | null | undefined;
+  for (const record of records) {
+    if (record.isSidechain === true) continue;
+    if (record.uuid !== undefined) {
+      defined.add(record.uuid);
+      if (firstParent === undefined) firstParent = record.parentUuid ?? null;
+    }
+    if (record.subtype === "compact_boundary" || record.isCompactSummary === true) {
+      compacted = true;
+      if (record.logicalParentUuid) parents.push(record.logicalParentUuid);
+    }
+  }
+  if (compacted && firstParent) parents.push(firstParent);
+  return {
+    tailUuids: Array.from(defined).slice(-CLAUDE_LINEAGE_TAIL_UUIDS),
+    continuesFrom: Array.from(new Set(parents.filter((uuid) => !defined.has(uuid)))),
+  };
+}
+
+/** Title suffix for a transcript that a newer file continues after compaction. */
+export const CLAUDE_BEFORE_COMPACT_SUFFIX = "(before compact)";
+
+export function withBeforeCompactSuffix(title: string): string {
+  return title.endsWith(CLAUDE_BEFORE_COMPACT_SUFFIX)
+    ? title
+    : `${title} ${CLAUDE_BEFORE_COMPACT_SUFFIX}`;
+}
+
+/**
+ * Claude resumes a transcript only from the directory derived from its cwd.
+ * A transcript copied from another machine still records that machine's cwd
+ * first, so prefer the latest cwd that matches the directory the file is in.
+ */
+function selectClaudeCwd(
+  cwds: ReadonlyArray<string>,
+  projectDirectoryName: string,
+  caseFold: boolean,
+): string | null {
+  const fold = (value: string) => (caseFold ? value.toLowerCase() : value);
+  const expected = fold(projectDirectoryName);
+  return (
+    cwds.findLast((cwd) => fold(claudeProjectDirectoryName(cwd)) === expected) ?? cwds[0] ?? null
+  );
+}
+
 function normalizeTimestamp(value: string | undefined, fallback: string): string {
   if (value === undefined) return fallback;
   const parsed = DateTime.make(value);
@@ -304,6 +390,7 @@ function parseAgentSessionRecords(
   // timestamp text, so only transcript metadata can provide a resumable ID.
   let providerSessionId = input.source === "codex" ? "" : input.fallbackSessionId;
   let title: string | null = null;
+  let aiGeneratedTitle: string | null = null;
   let model: string | null = null;
   let hasCodexSessionId = false;
   const messages: Array<AgentSessionThreadMessage & { readonly codexResponseUser: boolean }> = [];
@@ -404,7 +491,11 @@ function parseAgentSessionRecords(
         continue;
       }
       if (record.sessionId?.trim()) providerSessionId = record.sessionId.trim();
-      if (record.aiTitle?.trim()) title = record.aiTitle.trim();
+      // `/rename` writes `custom-title`; it outranks the generated `ai-title`.
+      const customTitle = cleanClaudeSessionTitle(record.customTitle);
+      if (customTitle !== null) title = customTitle;
+      const aiTitle = cleanClaudeSessionTitle(record.aiTitle);
+      if (aiTitle !== null) aiGeneratedTitle = aiTitle;
       const messageModel = record.message?.model?.trim();
       // Claude uses this sentinel for local error responses. It is not a
       // model ID that can be selected when the imported session resumes.
@@ -498,7 +589,10 @@ function parseAgentSessionRecords(
     source: input.source,
     providerInstanceId: input.providerInstanceId,
     providerSessionId,
-    title: title ?? (derivedTitle && derivedTitle.length > 0 ? derivedTitle : "Imported thread"),
+    title:
+      title ??
+      aiGeneratedTitle ??
+      (derivedTitle && derivedTitle.length > 0 ? derivedTitle : "Imported thread"),
     model,
     createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
     updatedAt: fallbackTimestamp,
@@ -522,6 +616,7 @@ function shouldRetainDecodedRecord(
       record.type === "assistant" ||
       record.sessionId !== undefined ||
       record.aiTitle !== undefined ||
+      record.customTitle !== undefined ||
       record.message?.model !== undefined
     );
   }
@@ -809,6 +904,44 @@ export const make = Effect.gen(function* () {
     ).pipe(Effect.orElseSucceed(() => null));
   });
 
+  const isLocalDirectory = (cwd: string) => {
+    const expanded = expandHomePath(cwd.trim(), homeDir);
+    return path.isAbsolute(expanded)
+      ? statOption(path.resolve(expanded)).pipe(
+          Effect.map((stats) => Option.isSome(stats) && stats.value.type === "Directory"),
+        )
+      : Effect.succeed(false);
+  };
+
+  /** Cwds recorded in the last records of a transcript, oldest first. */
+  const readTailCwds = Effect.fn("AgentSessionScanner.readTailCwds")(function* (
+    transcript: TranscriptCandidate,
+    budget: MetadataReadBudget,
+  ) {
+    const readSize = Math.min(CLAUDE_TAIL_READ_BYTES, transcript.size, budget.bytesRemaining);
+    if (readSize === 0 || budget.operationsRemaining < 2) {
+      budget.truncated = true;
+      return [];
+    }
+    budget.operationsRemaining -= 2;
+    budget.bytesRemaining -= readSize;
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const file = yield* fileSystem.open(transcript.filePath, { flag: "r" });
+        yield* file.seek(BigInt(transcript.size - readSize), "start");
+        const chunk = yield* file.readAlloc(readSize);
+        if (Option.isNone(chunk)) return [];
+        const lines = new TextDecoder().decode(chunk.value).split("\n");
+        // The first line is usually cut off mid-record.
+        if (readSize < transcript.size) lines.shift();
+        return lines.flatMap((line) => {
+          const cwd = extractCwd(line.trim());
+          return cwd === null ? [] : [cwd];
+        });
+      }),
+    ).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+  });
+
   /**
    * Project history fields while reading, before allocating whole JSON records.
    * Check the file identity on both sides of the read. A selected-history budget
@@ -1055,8 +1188,26 @@ export const make = Effect.gen(function* () {
     >();
 
     for (const transcript of transcripts) {
-      const cwd = yield* readCwd(transcript, budget);
-      if (cwd === null) continue;
+      const firstCwd = yield* readCwd(transcript, budget);
+      if (firstCwd === null) continue;
+      let cwd = firstCwd;
+      if (source === "claudeAgent") {
+        const directoryName = path.basename(path.dirname(transcript.filePath));
+        const fold = (value: string) => (foldWorktreeCase ? value.toLowerCase() : value);
+        // Only a transcript copied from another machine records a cwd that
+        // neither matches its directory nor exists here.
+        if (
+          fold(claudeProjectDirectoryName(firstCwd)) !== fold(directoryName) &&
+          !(yield* isLocalDirectory(firstCwd))
+        ) {
+          cwd =
+            selectClaudeCwd(
+              [firstCwd, ...(yield* readTailCwds(transcript, budget))],
+              directoryName,
+              foldWorktreeCase,
+            ) ?? firstCwd;
+        }
+      }
       const key = `${transcript.providerInstanceId}\0${cwd}`;
       const existing = byOwnerAndCwd.get(key);
       if (existing) {
@@ -1375,6 +1526,15 @@ export const make = Effect.gen(function* () {
       (source) => `${source.providerInstanceId}\0${source.filePath}`,
     );
     const importedSessions = new Set<string>();
+    // Transcripts stream newest first, so a compacted continuation registers
+    // the records it continues from before the older file is reached.
+    const continuedUuids = new Set<string>();
+    const followLineage = (lineage: AgentSessionImportSource["lineage"]) => {
+      if (lineage === undefined) return false;
+      const continued = lineage.tailUuids.some((uuid) => continuedUuids.has(uuid));
+      for (const uuid of lineage.continuesFrom) continuedUuids.add(uuid);
+      return continued;
+    };
     let bytesRemaining = MAX_IMPORT_BYTES;
     let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
     let recordsRemaining = MAX_IMPORT_RECORDS;
@@ -1406,6 +1566,7 @@ export const make = Effect.gen(function* () {
             return Option.some<AgentSessionRecentThread>({
               _tag: "AlreadyImported",
               source: completedSource,
+              continuedAfterCompact: followLineage(completedSource.lineage),
             });
           }
           if (
@@ -1431,11 +1592,18 @@ export const make = Effect.gen(function* () {
           recordsRemaining -= snapshot.recordCount;
 
           // A stable replacement file can belong to a different project than the cached candidate.
-          let snapshotCwd: string | null = null;
-          for (const record of snapshot.records) {
-            snapshotCwd = extractDecodedCwd(record);
-            if (snapshotCwd !== null) break;
-          }
+          const recordedCwds = snapshot.records.flatMap((record) => {
+            const cwd = extractDecodedCwd(record);
+            return cwd === null ? [] : [cwd];
+          });
+          const snapshotCwd =
+            candidate.source === "claudeAgent"
+              ? selectClaudeCwd(
+                  recordedCwds,
+                  path.basename(path.dirname(transcript.filePath)),
+                  foldWorktreeCase,
+                )
+              : (recordedCwds[0] ?? null);
           if (snapshotCwd === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
@@ -1460,12 +1628,25 @@ export const make = Effect.gen(function* () {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
 
+          const lineage =
+            parsedThread.source === "claudeAgent"
+              ? claudeTranscriptLineage(snapshot.records)
+              : undefined;
           const source: AgentSessionImportSource = {
             ...identity,
             provider: parsedThread.source,
             providerInstanceId: parsedThread.providerInstanceId,
             providerSessionId: parsedThread.providerSessionId,
+            ...(lineage === undefined
+              ? {}
+              : {
+                  lineage: {
+                    tailUuids: [...lineage.tailUuids],
+                    continuesFrom: [...lineage.continuesFrom],
+                  },
+                }),
           };
+          const continuedAfterCompact = followLineage(source.lineage);
           const sessionKey = `${parsedThread.providerInstanceId}\0${parsedThread.providerSessionId}`;
           if (importedSessions.has(sessionKey)) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Duplicate", source });
@@ -1473,7 +1654,9 @@ export const make = Effect.gen(function* () {
           importedSessions.add(sessionKey);
           return Option.some<AgentSessionRecentThread>({
             _tag: "Importable",
-            thread: parsedThread,
+            thread: continuedAfterCompact
+              ? { ...parsedThread, title: withBeforeCompactSuffix(parsedThread.title) }
+              : parsedThread,
             source,
           });
         }).pipe(importReadLock.withPermits(1)),

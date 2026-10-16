@@ -73,7 +73,12 @@ it.effect("imports messages once and preserves the provider native resume bindin
           getThreadRecords: () =>
             imported
               ? Effect.succeed({
-                  thread: { id: threadId, projectId, historyOrigin: "v1_import" },
+                  thread: {
+                    id: threadId,
+                    projectId,
+                    historyOrigin: "v1_import",
+                    title: "Imported thread",
+                  },
                 } as never)
               : Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId })),
         }),
@@ -143,5 +148,97 @@ it.effect("imports messages once and preserves the provider native resume bindin
       }),
     ]);
     expect(recorded).toHaveLength(2);
+  }).pipe(Effect.provide(layerTest));
+});
+
+it.effect("follows transcript renames and compactions for imported threads", () => {
+  const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+  const sessionId = "0b6a3f1e-8f61-4e83-9d0f-3c7d1c2f9a10";
+  const renamedThreadId = ThreadId.make(`import:${claudeInstanceId}:${sessionId}`);
+  const olderSessionId = "5d4c1b2a-1e2f-4a3b-8c9d-0e1f2a3b4c5d";
+  const olderThreadId = ThreadId.make(`import:${claudeInstanceId}:${olderSessionId}`);
+  const source = (providerSessionId: string) => ({
+    provider: "claudeAgent" as const,
+    providerInstanceId: claudeInstanceId,
+    providerSessionId,
+    filePath: `/claude/projects/-workspace-project/${providerSessionId}.jsonl`,
+    size: 100,
+    mtimeMs: 2,
+    device: 3,
+    inode: 4,
+    birthtimeMs: 1,
+  });
+  const titles = new Map<string, string>([
+    [renamedThreadId, "Old name"],
+    [olderThreadId, "Ship release"],
+  ]);
+  const dispatched: Array<{ readonly threadId: string; readonly title: string | undefined }> = [];
+  const scanner = AgentSessionScanner.AgentSessionScanner.of({
+    scan: Effect.die("unused"),
+    recentThreads: () =>
+      Stream.make(
+        {
+          _tag: "Importable" as const,
+          source: source(sessionId),
+          thread: {
+            source: "claudeAgent" as const,
+            providerInstanceId: claudeInstanceId,
+            providerSessionId: sessionId,
+            title: "PMO@HOME",
+            model: null,
+            createdAt: "2026-09-01T10:00:00.000Z",
+            updatedAt: "2026-09-01T10:01:00.000Z",
+            messages: [
+              { role: "user" as const, text: "Hi", createdAt: "2026-09-01T10:00:00.000Z" },
+            ],
+          },
+        },
+        {
+          _tag: "AlreadyImported" as const,
+          source: source(olderSessionId),
+          continuedAfterCompact: true,
+        },
+      ),
+  });
+  const layerTest = AgentSessionImporter.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.succeed(AgentSessionScanner.AgentSessionScanner, scanner),
+        Layer.mock(ProjectService.ProjectService)({
+          getById: () =>
+            Effect.succeed(
+              Option.some({ id: projectId, workspaceRoot: "/workspace/project" } as never),
+            ),
+        }),
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadRecords: (id) =>
+            Effect.succeed({
+              thread: { id, projectId, historyOrigin: "v1_import", title: titles.get(id) },
+            } as never),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              if (command.type === "thread.metadata.update") {
+                dispatched.push({ threadId: command.threadId, title: command.title });
+              }
+              return {} as never;
+            }),
+        }),
+        Layer.mock(EventSink.EventSinkV2)({}),
+        Layer.mock(ProviderSessionRuntime.ProviderSessionRuntimeRepository)({
+          list: () => Effect.succeed([]),
+          recordImportedTranscript: () => Effect.void,
+        }),
+        IdAllocator.layer,
+      ),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    const importer = yield* AgentSessionImporter.AgentSessionImporter;
+    yield* importer.importRecentAgentThreads({ projectId });
+    expect(dispatched).toEqual([
+      { threadId: renamedThreadId, title: "PMO@HOME" },
+      { threadId: olderThreadId, title: "Ship release (before compact)" },
+    ]);
   }).pipe(Effect.provide(layerTest));
 });
