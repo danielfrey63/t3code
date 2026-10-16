@@ -57,6 +57,14 @@ history for that message. The cache lasts about an hour on a Claude
 subscription and 5 minutes with an API key, Bedrock, or Vertex. See [commands and skills](./composer.md#commands-and-skills) for using
 composer commands.
 
+## Continue Claude Code sessions
+
+Start a new thread in a project and choose **or resume a session** under the headline. The list shows Claude Code and Codex sessions from the last 30 days in that project, on every connected environment that has the same project.
+
+Sessions keep the name you gave them with `/rename`. Renaming the thread in T3 Code also renames the session, so `claude --resume` shows the same name. When a compaction continued in a new transcript, the older, complete transcript is listed separately with "(before compact)".
+
+A Claude session from another environment continues on the provider selected in the composer. With Claude, T3 Code copies the session unchanged and resumes it, including its full context. With Codex or another provider, the new thread starts from the conversation: its first turn receives as much of the history as the model's context window allows, and tool activity stays behind. A session that was continued separately on both environments is not overwritten. Sessions larger than 128 MiB cannot be transferred.
+
 ## Usage limits
 
 If your Claude subscription runs out of usage mid-turn, the thread shows which

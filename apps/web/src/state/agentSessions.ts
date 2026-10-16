@@ -3,6 +3,7 @@ import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
 } from "@t3tools/client-runtime/state/runtime";
+import { createAgentSessionTransferAtoms } from "@t3tools/client-runtime/state/agentSessionTransfer";
 
 import { connectionAtomRuntime } from "../connection/runtime";
 
@@ -23,3 +24,18 @@ export const agentSessionImport = createEnvironmentRpcCommand(connectionAtomRunt
   label: "environment-data:agent-sessions:import",
   tag: WS_METHODS.agentSessionsImport,
 });
+
+/** Native sessions a project can continue. Rescanned each time the picker opens. */
+export const agentSessionList = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+  label: "environment-data:agent-sessions:list",
+  tag: WS_METHODS.agentSessionsList,
+  staleTimeMs: 0,
+  idleTtlMs: 60_000,
+});
+
+export const agentSessionOpen = createEnvironmentRpcCommand(connectionAtomRuntime, {
+  label: "environment-data:agent-sessions:open",
+  tag: WS_METHODS.agentSessionsOpen,
+});
+
+export const agentSessionTransfer = createAgentSessionTransferAtoms(connectionAtomRuntime);

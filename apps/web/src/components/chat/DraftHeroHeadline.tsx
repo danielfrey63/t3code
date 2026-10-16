@@ -1,6 +1,11 @@
 import type { DraftId } from "~/composerDraftStore";
 import { composerDraftHasUserContent, useComposerDraftStore } from "~/composerDraftStore";
-import { resolveEnvironmentMachineKind, type ScopedProjectRef } from "@t3tools/contracts";
+import {
+  resolveEnvironmentMachineKind,
+  type ProviderDriverKind,
+  type ProviderInstanceId,
+  type ScopedProjectRef,
+} from "@t3tools/contracts";
 import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 import { FolderPlusIcon } from "lucide-react";
@@ -39,6 +44,7 @@ import {
   useComboboxFilter,
 } from "../ui/combobox";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { ResumeSessionAction } from "./ResumeSessionDialog";
 import { InlineButton } from "../ui/button";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 
@@ -55,12 +61,17 @@ interface DraftHeroHeadlineProps {
   readonly draftId: DraftId | null;
   readonly activeProjectRef: ScopedProjectRef | null;
   readonly activeProjectTitle: string | null;
+  /** The provider the draft would start on; a resumed session from elsewhere continues there. */
+  readonly activeProviderInstanceId: ProviderInstanceId | null;
+  readonly activeProviderDriver: ProviderDriverKind | null;
 }
 
 export function DraftHeroHeadline({
   draftId,
   activeProjectRef,
   activeProjectTitle,
+  activeProviderInstanceId,
+  activeProviderDriver,
 }: DraftHeroHeadlineProps) {
   const projects = useProjects();
   const threads = useThreadShells();
@@ -402,6 +413,16 @@ export function DraftHeroHeadline({
       </Tooltip>
     ) : null;
 
+  const orResumeSession =
+    !isScratchDraft && hasResolvedProject && activeProjectRef !== null ? (
+      <ResumeSessionAction
+        current={activeProjectRef}
+        members={activeProjectGroup?.memberProjects ?? []}
+        targetProviderInstanceId={activeProviderInstanceId}
+        targetDriver={activeProviderDriver}
+      />
+    ) : null;
+
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col items-center">
       <h1
@@ -420,9 +441,10 @@ export function DraftHeroHeadline({
       </h1>
       {/* Reserved whenever threads can skip a project, so the heading does not
           move. Without a project, the picker moves here to choose one. */}
-      {scratchWorkspaceRoot === null ? null : (
-        <p className="mt-2 flex h-6 items-center text-sm">
+      {scratchWorkspaceRoot === null && orResumeSession === null ? null : (
+        <p className="mt-2 flex h-6 items-center gap-3 text-sm">
           {isScratchDraft ? projectSelector : orStartWithoutProject}
+          {orResumeSession}
         </p>
       )}
     </div>

@@ -11437,6 +11437,8 @@ export default function ChatView(props: ChatViewProps) {
                           draftId={draftId}
                           activeProjectRef={activeProjectRef}
                           activeProjectTitle={activeProject?.title ?? null}
+                          activeProviderInstanceId={activeProviderInstanceId}
+                          activeProviderDriver={selectedProvider ?? null}
                         />
                       </div>
                     </div>
